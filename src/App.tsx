@@ -1,18 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
+import type React from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarGrid } from './components/CalendarGrid';
 import { TitleBar } from './components/TitleBar';
 import { EventDialog } from './dialogs/EventDialog';
 import { SettingsPanel } from './pages/SettingsPanel';
 import { api } from './services/tauriApi';
 import type { AuthState, CalendarEvent, CalendarInfo, Settings, SyncState } from './types/calendar';
-import { monthKey } from './utils/date';
+import { eventDisplayTime, eventsForDay, monthKey } from './utils/date';
+import { DEFAULT_EVENT_COLOR, eventColorKey, normalizeHex, readableText, resolveEventColor } from './utils/colors';
 import './styles/app.css';
 
 const defaultSettings: Settings = {
   theme: 'system', alwaysOnTop: false, startWithWindows: false, startHidden: false,
   rememberPosition: true, rememberSize: true, opacity: 0.96, visibleCalendarIds: [],
   firstDayOfWeek: 1, timeFormat: '24h', automaticSync: true, syncIntervalMinutes: 15,
-  selectedMonth: ''
+  selectedMonth: '', calendarColors: {}, eventColors: {}, fontScale: 1, density: 'comfortable', zoom: 1, accentColor: null
 };
 
 function monthRange(month: Date) {
@@ -36,6 +38,12 @@ function isOfflineError(message: string): boolean {
   return /network|timed out|timeout|connection|dns|offline|fetch/i.test(message);
 }
 
+type SyncReason = 'start' | 'interval' | 'manual' | 'calendars' | 'after-save' | 'after-delete';
+
+// Module-level counter so the console shows WHO triggered each call (P0-0 instrumentation).
+let syncCallCount = 0;
+console.debug('[calendar] App module evaluated', performance.getEntriesByType('navigation').map(n => (n as PerformanceNavigationTiming).type));
+
 export default function App() {
   const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [selectedDay, setSelectedDay] = useState(() => new Date());
@@ -49,11 +57,31 @@ export default function App() {
   const [eventDialog, setEventDialog] = useState<{ event?: CalendarEvent; date: Date } | null>(null);
   const [error, setError] = useState('');
 
+  // Refs hold the latest values for callbacks/intervals so they never read a stale closure.
+  const monthRef = useRef(month);
+  const authRef = useRef(auth);
+  const calendarsRef = useRef(calendars);
+  monthRef.current = month;
+  authRef.current = auth;
+  calendarsRef.current = calendars;
+
+  const displaySeq = useRef(0);        // discards out-of-order cache reads
+  const syncingRef = useRef(false);    // only one network sync at a time
+  const queuedRef = useRef(false);     // a sync requested while another runs is coalesced into one
+  const pendingSave = useRef<Promise<unknown>>(Promise.resolve());
+
+  const visibleIds = settings.visibleCalendarIds ?? [];
+  const visibleKey = visibleIds.join('|');
+  const monthId = monthKey(month);
+  const syncEveryMs = Math.max(1, Number(settings.syncIntervalMinutes) || 15) * 60_000;
+
   const visibleCalendars = useMemo(
-    () => calendars.filter(c => (settings.visibleCalendarIds ?? []).includes(c.id)),
-    [calendars, settings.visibleCalendarIds]
+    () => calendars.filter(c => visibleIds.includes(c.id)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [calendars, visibleKey]
   );
 
+  // 1) Boot: load persisted settings + auth once.
   useEffect(() => {
     (async () => {
       try {
@@ -64,83 +92,125 @@ export default function App() {
           visibleCalendarIds: Array.isArray(savedSettings?.visibleCalendarIds) ? savedSettings.visibleCalendarIds : [],
         };
         setSettings(restoredSettings);
-        setSettingsReady(true);
         setAuth(savedAuth);
         const restoredMonth = monthFromKey(restoredSettings.selectedMonth);
         if (restoredMonth) setMonth(restoredMonth);
       } catch (e) {
-        setSettingsReady(true);
         setError(errorText(e));
+      } finally {
+        setSettingsReady(true);
       }
     })();
   }, []);
 
+  // 2) Persist settings. The promise is remembered so a sync never reads stale settings.json.
   useEffect(() => {
     if (!settingsReady) return;
-    document.documentElement.dataset.theme = settings.theme;
-    document.documentElement.style.setProperty('--window-opacity', String(settings.opacity));
-    api.saveSettings(settings).catch(e => setError(errorText(e)));
+    const root = document.documentElement;
+    root.dataset.theme = settings.theme;
+    root.dataset.density = settings.density ?? 'comfortable';
+    root.style.setProperty('--fs', String(settings.fontScale ?? 1));
+    root.style.setProperty('--zoom', String(settings.zoom ?? 1));
+    const accent = normalizeHex(settings.accentColor);
+    if (accent) {
+      root.style.setProperty('--accent', accent);
+      root.style.setProperty('--accent-soft', `color-mix(in srgb, ${accent} 18%, transparent)`);
+      root.style.setProperty('--accent-fg', readableText(accent));
+    } else {
+      ['--accent', '--accent-soft', '--accent-fg'].forEach(p => root.style.removeProperty(p));
+    }
+    console.debug('[calendar] saveSettings');
+    pendingSave.current = api.saveSettings(settings).catch(e => setError(errorText(e)));
   }, [settings, settingsReady]);
 
   useEffect(() => {
     if (!settingsReady) return;
-    setSettings(current => current.selectedMonth === monthKey(month) ? current : { ...current, selectedMonth: monthKey(month) });
-  }, [month, settingsReady]);
+    setSettings(current => current.selectedMonth === monthId ? current : { ...current, selectedMonth: monthId });
+  }, [monthId, settingsReady]);
+
+  // Ctrl + / Ctrl - / Ctrl 0: persisted zoom.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === '0') { e.preventDefault(); setSettings(c => ({ ...c, zoom: 1 })); return; }
+      const step = e.key === '+' || e.key === '=' ? 0.1 : e.key === '-' ? -0.1 : 0;
+      if (!step) return;
+      e.preventDefault();
+      setSettings(c => ({ ...c, zoom: Math.min(2, Math.max(0.7, Math.round(((c.zoom ?? 1) + step) * 10) / 10)) }));
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // 3) DISPLAY: read the local cache for the visible month. No network. Runs on month change only.
+  const showCached = useCallback(async (reason: string) => {
+    const seq = ++displaySeq.current;
+    const range = monthRange(monthRef.current);
+    try {
+      const cached = await api.getCachedEvents(range.start, range.end);
+      if (seq !== displaySeq.current) return;           // a newer read superseded this one
+      console.debug(`[calendar] showCached(${reason}) -> ${cached.length} events`);
+      setEvents(cached);
+    } catch (e) {
+      if (seq === displaySeq.current) setSync({ status: 'error', message: errorText(e) });
+    }
+  }, []);
 
   useEffect(() => {
+    if (!settingsReady) return;
+    void showCached(`month ${monthId}`);
+  }, [monthId, settingsReady, showCached]);
+
+  // 4) SYNC: network. Single-flight; concurrent requests collapse into one follow-up run.
+  const refresh = useCallback(async (reason: SyncReason) => {
+    if (!authRef.current.authenticated) return;
+    if (syncingRef.current) { queuedRef.current = true; return; }
+    syncingRef.current = true;
+    const id = ++syncCallCount;
+    console.debug(`[calendar] sync #${id} start (${reason})`);
+    if (reason !== 'interval') setSync(prev => ({ ...prev, status: 'syncing' }));
+    try {
+      await pendingSave.current;   // make sure Rust sees the current visibleCalendarIds
+      if (!calendarsRef.current.length) {
+        try {
+          const list = await api.listCalendars();
+          setCalendars(list);
+          calendarsRef.current = list;
+          setSettings(current => (current.visibleCalendarIds ?? []).length
+            ? current
+            : { ...current, visibleCalendarIds: list.map(c => c.id), defaultCalendarId: list.find(c => c.primary)?.id || list[0]?.id });
+        } catch (e) {
+          const cachedList = await api.getCachedCalendars().catch(() => []);
+          if (cachedList.length) setCalendars(cachedList);
+          throw e;
+        }
+      }
+      const result = await api.sync();
+      console.debug(`[calendar] sync #${id} done`, result.message);
+      setSync(result);
+      await showCached(`after sync #${id}`);
+    } catch (e) {
+      const message = errorText(e);
+      console.debug(`[calendar] sync #${id} failed`, message);
+      setSync({ status: /authentication required/i.test(message) ? 'auth-required' : isOfflineError(message) ? 'offline' : 'error', message });
+    } finally {
+      syncingRef.current = false;
+      if (queuedRef.current) { queuedRef.current = false; void refresh('calendars'); }
+    }
+  }, [showCached]);
+
+  // Sync on start / sign-in and when the set of visible calendars changes. NOT on month change.
+  useEffect(() => {
     if (!auth.authenticated || !settingsReady) return;
-    void loadData();
-  }, [auth.authenticated, settingsReady, month, (settings.visibleCalendarIds ?? []).join('|')]);
+    void refresh(visibleKey ? 'calendars' : 'start');
+  }, [auth.authenticated, settingsReady, visibleKey, refresh]);
 
   useEffect(() => {
     if (!auth.authenticated || !settings.automaticSync || !settingsReady) return;
-    const id = window.setInterval(() => void refresh(true), settings.syncIntervalMinutes * 60_000);
-    return () => window.clearInterval(id);
-  }, [auth.authenticated, settings.automaticSync, settings.syncIntervalMinutes, settingsReady]);
-
-  async function loadData() {
-    const range = monthRange(month);
-    try {
-      setEvents(await api.getCachedEvents(range.start, range.end));
-    } catch (e) {
-      setSync({ status: 'error', message: errorText(e) });
-    }
-
-    if (!calendars.length) {
-      try {
-        const calendarList = await api.listCalendars();
-        setCalendars(calendarList);
-        setSettings(current => (current.visibleCalendarIds ?? []).length
-          ? current
-          : { ...current, visibleCalendarIds: calendarList.map(c => c.id), defaultCalendarId: calendarList.find(c => c.primary)?.id || calendarList[0]?.id });
-      } catch (e) {
-        try {
-          const cachedCalendars = await api.getCachedCalendars();
-          if (cachedCalendars.length) setCalendars(cachedCalendars);
-        } catch {
-          // Event cache remains useful even without calendar metadata.
-        }
-        const message = errorText(e);
-        setSync({ status: isOfflineError(message) ? 'offline' : 'error', message });
-      }
-    }
-
-    await refresh(true);
-  }
-
-  async function refresh(silent = false) {
-    if (!auth.authenticated) return;
-    if (!silent) setSync({ status: 'syncing' });
-    try {
-      const result = await api.sync();
-      setSync(result);
-      const range = monthRange(month);
-      setEvents(await api.getCachedEvents(range.start, range.end));
-    } catch (e) {
-      const message = errorText(e);
-      setSync({ status: /authentication required/i.test(message) ? 'auth-required' : isOfflineError(message) ? 'offline' : 'error', message });
-    }
-  }
+    console.debug(`[calendar] interval set to ${syncEveryMs} ms`);
+    const timer = window.setInterval(() => void refresh('interval'), syncEveryMs);
+    return () => window.clearInterval(timer);
+  }, [auth.authenticated, settings.automaticSync, settingsReady, syncEveryMs, refresh]);
 
   async function signIn() {
     try {
@@ -164,13 +234,19 @@ export default function App() {
     }
   }
 
-  async function saveEvent(event: CalendarEvent) {
+  async function saveEvent(event: CalendarEvent, color: string | null) {
     try {
       const saved = event.id ? await api.updateEvent(event) : await api.createEvent(event);
+      setSettings(cur => {
+        const map = { ...(cur.eventColors ?? {}) };
+        const key = eventColorKey(saved);
+        if (color) map[key] = color; else delete map[key];
+        return { ...cur, eventColors: map };
+      });
       setEvents(old => event.id
         ? old.map(existing => existing.id === saved.id && existing.calendarId === saved.calendarId ? saved : existing)
         : [...old, saved]);
-      await refresh(true);
+      await refresh('after-save');
     } catch (e) {
       setError(errorText(e));
       throw e;
@@ -183,16 +259,17 @@ export default function App() {
       await api.deleteEvent(event.calendarId, event.id);
       setEvents(old => old.filter(e => !(e.id === event.id && e.calendarId === event.calendarId)));
       setEventDialog(null);
-      await refresh(true);
+      await refresh('after-delete');
     } catch (e) {
       setError(errorText(e));
     }
   }
 
-  const shownEvents = events.filter(e => (settings.visibleCalendarIds ?? []).includes(e.calendarId));
+  const colorForCalendar = (id: string) => normalizeHex(settings.calendarColors?.[id]) || normalizeHex(calendars.find(c => c.id === id)?.backgroundColor) || DEFAULT_EVENT_COLOR;
+  const shownEvents = events.filter(e => visibleIds.includes(e.calendarId));
 
   return <div className="app-shell">
-    <TitleBar onSettings={() => setSettingsOpen(true)} />
+    <TitleBar onSettings={() => setSettingsOpen(true)} onError={setError} />
     <main>
       <CalendarGrid
         month={month}
@@ -205,10 +282,25 @@ export default function App() {
         onEvent={(event) => setEventDialog({ event, date: selectedDay })}
         onCreate={(date) => setEventDialog({ date })}
         onToday={() => { const day = new Date(); setSelectedDay(day); setMonth(new Date(day.getFullYear(), day.getMonth(), 1)); }}
-        onRefresh={() => void refresh(false)}
+        onRefresh={() => void refresh('manual')}
       />
     </main>
-    <footer className="statusbar">
+    <section className="agenda" aria-label="Selected day events">
+      <div className="agenda-head">
+        <span>{new Intl.DateTimeFormat(undefined, { dateStyle: 'full' }).format(selectedDay)}</span>
+        <button aria-label="New event" onClick={() => setEventDialog({ date: selectedDay })}>+ New</button>
+      </div>
+      {eventsForDay(shownEvents, selectedDay).length === 0 && <div className="agenda-empty">No events</div>}
+      {eventsForDay(shownEvents, selectedDay).map(ev => {
+        const cal = calendars.find(c => c.id === ev.calendarId);
+        return <button key={`${ev.calendarId}:${ev.id}`} className="agenda-item" style={{ '--event-color': resolveEventColor(ev, settings) } as React.CSSProperties} onClick={() => setEventDialog({ event: ev, date: selectedDay })}>
+          <small>{ev.start.date ? 'All day' : eventDisplayTime(ev, settings.timeFormat)}</small>
+          <span>{ev.summary || '(No title)'}</span>
+          <small>{cal?.summary}{ev.location ? ` · ${ev.location}` : ''}</small>
+        </button>;
+      })}
+    </section>
+    <footer className="statusbar" aria-live="polite">
       <span className={`status-dot ${sync.status}`} />
       {sync.status === 'syncing' ? 'Syncing…' : sync.status === 'synced' ? 'Synced' : sync.status === 'offline' ? 'Offline' : sync.status === 'auth-required' ? 'Authentication required' : auth.authenticated ? 'Ready' : 'Sign in to sync'}
       <span className="status-spacer" />
@@ -216,7 +308,7 @@ export default function App() {
     </footer>
     {!auth.authenticated && <div className="signin-hint"><button className="primary-button" onClick={() => void signIn()}>Sign in with Google</button><span>Cached events are kept locally for temporary offline access.</span></div>}
     {settingsOpen && <SettingsPanel settings={settings} calendars={calendars} auth={auth} onChange={setSettings} onClose={() => setSettingsOpen(false)} onSignIn={() => void signIn()} onSignOut={() => void signOut()} onError={setError} />}
-    {eventDialog && <EventDialog event={eventDialog.event} date={eventDialog.date} calendars={visibleCalendars.length ? visibleCalendars : calendars} defaultCalendarId={settings.defaultCalendarId} onClose={() => setEventDialog(null)} onSave={saveEvent} onDelete={eventDialog.event ? () => deleteEvent(eventDialog.event!) : undefined} />}
+    {eventDialog && <EventDialog event={eventDialog.event} date={eventDialog.date} calendars={visibleCalendars.length ? visibleCalendars : calendars} defaultCalendarId={settings.defaultCalendarId} onClose={() => setEventDialog(null)} eventColor={eventDialog.event ? settings.eventColors?.[eventColorKey(eventDialog.event)] : undefined} colorFor={colorForCalendar} onSave={saveEvent} onDelete={eventDialog.event ? () => deleteEvent(eventDialog.event!) : undefined} />}
     {error && <div className="toast" role="status" onClick={() => setError('')}>{error}</div>}
   </div>;
 }

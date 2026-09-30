@@ -1,4 +1,4 @@
-export type ThemeMode = 'light' | 'dark' | 'system';
+export type ThemeMode = 'light' | 'dark' | 'system' | 'contrast';
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'offline' | 'auth-required' | 'error';
 
 export interface CalendarInfo {
@@ -56,6 +56,12 @@ export interface Settings {
   automaticSync: boolean;
   syncIntervalMinutes: number;
   selectedMonth: string;
+  calendarColors: Record<string, string>;
+  eventColors: Record<string, string>;
+  fontScale: number;
+  density: 'compact' | 'comfortable';
+  zoom: number;
+  accentColor?: string | null;
 }
 
 export interface AuthState {

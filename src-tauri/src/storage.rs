@@ -3,7 +3,7 @@ use keyring::Entry;
 use tauri::Manager;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use chrono::{DateTime, Utc};
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
 
 const SERVICE: &str = "calendar-gadget";
 const REFRESH_TOKEN: &str = "google-refresh-token";
@@ -31,9 +31,6 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
         serde_json::to_vec_pretty(value).map_err(|e| AppError::Storage(e.to_string()))?,
     )
     .map_err(|e| AppError::Storage(e.to_string()))?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| AppError::Storage(e.to_string()))?;
-    }
     fs::rename(tmp, path).map_err(|e| AppError::Storage(e.to_string()))?;
     Ok(())
 }
@@ -62,34 +59,54 @@ pub struct Cache {
     pub sync_tokens: HashMap<String, String>,
 }
 
-pub fn get_cache(app: &tauri::AppHandle) -> Result<Cache, AppError> {
+/// Single lock for every cache read-modify-write. Never held across an `.await`.
+static CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Loads the cache from disk. Callers must hold CACHE_LOCK.
+fn load_cache(app: &tauri::AppHandle) -> Result<Cache, AppError> {
     let path = data_dir(app)?.join("cache.json");
-    match read_json(&path) {
+    if !path.exists() {
+        return Ok(Cache::default());
+    }
+    // An I/O error is transient: surface it, never wipe the cache because of it.
+    let text = fs::read_to_string(&path).map_err(|e| AppError::Storage(e.to_string()))?;
+    match serde_json::from_str::<Cache>(&text) {
         Ok(cache) => Ok(cache),
         Err(error) => {
-            let corrupt = path.with_extension("corrupt.json");
-            let _ = fs::rename(&path, &corrupt);
-            log::warn!("Local calendar cache was reset after a read error: {error}");
+            // Writes are atomic now, so a parse failure means real corruption.
+            // Keep a copy for inspection instead of destroying the evidence.
+            let _ = fs::copy(&path, path.with_extension("corrupt.json"));
+            log::warn!("Local calendar cache is corrupt and was reset: {error}");
             Ok(Cache::default())
         }
     }
 }
 
-pub fn save_cache(app: &tauri::AppHandle, cache: &Cache) -> Result<(), AppError> {
-    write_json(&data_dir(app)?.join("cache.json"), cache)
+/// Runs `f` on the cache under the lock and persists the result (read-modify-write, atomic w.r.t. other callers).
+fn with_cache<R>(app: &tauri::AppHandle, f: impl FnOnce(&mut Cache) -> R) -> Result<R, AppError> {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = load_cache(app)?;
+    let result = f(&mut cache);
+    write_json(&data_dir(app)?.join("cache.json"), &cache)?;
+    log::debug!("cache saved: {} events, {} calendars", cache.events.len(), cache.calendars.len());
+    Ok(result)
+}
+
+fn read_cache<R>(app: &tauri::AppHandle, f: impl FnOnce(&Cache) -> R) -> Result<R, AppError> {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(f(&load_cache(app)?))
 }
 
 pub fn save_calendars(app: &tauri::AppHandle, calendars: Vec<crate::models::CalendarInfo>) -> Result<(), AppError> {
-    let mut cache = get_cache(app)?;
-    cache.calendars = calendars;
-    save_cache(app, &cache)
+    with_cache(app, |cache| cache.calendars = calendars)
 }
 
 pub fn cached_calendars(app: &tauri::AppHandle) -> Result<Vec<crate::models::CalendarInfo>, AppError> {
-    Ok(get_cache(app)?.calendars)
+    read_cache(app, |cache| cache.calendars.clone())
 }
 
 pub fn clear_cache(app: &tauri::AppHandle) -> Result<(), AppError> {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = data_dir(app)?.join("cache.json");
     match fs::remove_file(path) {
         Ok(_) => Ok(()),
@@ -99,15 +116,33 @@ pub fn clear_cache(app: &tauri::AppHandle) -> Result<(), AppError> {
 }
 
 pub fn merge_events(app: &tauri::AppHandle, incoming: Vec<CalendarEvent>) -> Result<(), AppError> {
-    let mut cache = get_cache(app)?;
-    for event in incoming {
-        if let Some(existing) = cache.events.iter_mut().find(|x| x.id == event.id && x.calendar_id == event.calendar_id) {
-            *existing = event;
-        } else {
-            cache.events.push(event);
+    with_cache(app, |cache| {
+        for event in incoming {
+            if let Some(existing) = cache.events.iter_mut().find(|x| x.id == event.id && x.calendar_id == event.calendar_id) {
+                *existing = event;
+            } else {
+                cache.events.push(event);
+            }
         }
-    }
-    save_cache(app, &cache)
+    })
+}
+
+/// Full (non-incremental) sync result: swaps one calendar's events and token in a single write,
+/// so readers never observe an emptied calendar.
+pub fn replace_calendar_events(
+    app: &tauri::AppHandle,
+    calendar_id: &str,
+    events: Vec<CalendarEvent>,
+    sync_token: Option<String>,
+) -> Result<(), AppError> {
+    with_cache(app, |cache| {
+        cache.events.retain(|e| e.calendar_id != calendar_id);
+        cache.events.extend(events);
+        match sync_token {
+            Some(token) => { cache.sync_tokens.insert(calendar_id.to_string(), token); }
+            None => { cache.sync_tokens.remove(calendar_id); }
+        }
+    })
 }
 
 fn apply_event_changes(
@@ -137,27 +172,19 @@ pub fn apply_incremental_changes(
     removed_event_ids: &[String],
     sync_token: String,
 ) -> Result<(), AppError> {
-    let mut cache = get_cache(app)?;
-    apply_event_changes(&mut cache, calendar_id, &changed, removed_event_ids, sync_token);
-    save_cache(app, &cache)
+    with_cache(app, |cache| apply_event_changes(cache, calendar_id, &changed, removed_event_ids, sync_token))
 }
 
 pub fn remove_event(app: &tauri::AppHandle, calendar_id: &str, event_id: &str) -> Result<(), AppError> {
-    let mut cache = get_cache(app)?;
-    cache.events.retain(|e| !(e.calendar_id == calendar_id && e.id == event_id));
-    save_cache(app, &cache)
-}
-
-pub fn clear_calendar(app: &tauri::AppHandle, calendar_id: &str) -> Result<(), AppError> {
-    let mut cache = get_cache(app)?;
-    cache.events.retain(|event| event.calendar_id != calendar_id);
-    cache.sync_tokens.remove(calendar_id);
-    save_cache(app, &cache)
+    with_cache(app, |cache| cache.events.retain(|e| !(e.calendar_id == calendar_id && e.id == event_id)))
 }
 
 pub fn cached_events(app: &tauri::AppHandle, start: &str, end: &str) -> Result<Vec<CalendarEvent>, AppError> {
-    let cache = get_cache(app)?;
-    Ok(cache.events.into_iter().filter(|e| overlaps(e, start, end)).collect())
+    let events: Vec<CalendarEvent> = read_cache(app, |cache| {
+        cache.events.iter().filter(|e| overlaps(e, start, end)).cloned().collect()
+    })?;
+    log::debug!("get_cached_events -> {} events", events.len());
+    Ok(events)
 }
 
 fn overlaps(event: &CalendarEvent, start: &str, end: &str) -> bool {
@@ -183,20 +210,7 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 }
 
 pub fn get_sync_token(app: &tauri::AppHandle, calendar_id: &str) -> Result<Option<String>, AppError> {
-    Ok(get_cache(app)?.sync_tokens.get(calendar_id).cloned())
-}
-
-pub fn set_sync_token(app: &tauri::AppHandle, calendar_id: &str, token: Option<String>) -> Result<(), AppError> {
-    let mut cache = get_cache(app)?;
-    match token {
-        Some(token) => {
-            cache.sync_tokens.insert(calendar_id.to_string(), token);
-        }
-        None => {
-            cache.sync_tokens.remove(calendar_id);
-        }
-    }
-    save_cache(app, &cache)
+    read_cache(app, |cache| cache.sync_tokens.get(calendar_id).cloned())
 }
 
 pub fn save_refresh_token(token: &str) -> Result<(), AppError> {

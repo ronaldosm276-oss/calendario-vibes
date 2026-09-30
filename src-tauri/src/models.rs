@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CalendarInfo {
@@ -78,6 +79,13 @@ pub struct Settings {
     pub sync_interval_minutes: u32,
     #[serde(alias = "selected_month")]
     pub selected_month: String,
+    // Local-only customization (never sent to Google).
+    pub calendar_colors: HashMap<String, String>,
+    pub event_colors: HashMap<String, String>,
+    pub font_scale: f64,
+    pub density: String,
+    pub zoom: f64,
+    pub accent_color: Option<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -96,6 +104,12 @@ impl Default for Settings {
             automatic_sync: true,
             sync_interval_minutes: 15,
             selected_month: "".into(),
+            calendar_colors: HashMap::new(),
+            event_colors: HashMap::new(),
+            font_scale: 1.0,
+            density: "comfortable".into(),
+            zoom: 1.0,
+            accent_color: None,
         }
     }
 }

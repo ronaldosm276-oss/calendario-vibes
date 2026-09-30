@@ -1,7 +1,6 @@
 use crate::{error::AppError, models::AuthState, storage};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::{distr::Alphanumeric, Rng};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fs, time::{Duration, Instant}};
@@ -77,7 +76,7 @@ impl AuthManager {
   if let Some(secret) = cfg.client_secret.as_deref() {
       form.push(("client_secret", secret));
   }
-  let req=Client::new().post(token_url).form(&form); let token:TokenResponse=req.send().await.map_err(|e|AppError::Network(e.to_string()))?.error_for_status().map_err(|e|AppError::OAuth(e.to_string()))?.json().await.map_err(|e|AppError::OAuth(e.to_string()))?;
+  let req=crate::http::client().post(token_url).form(&form); let token:TokenResponse=req.send().await.map_err(|e|AppError::Network(e.to_string()))?.error_for_status().map_err(|e|AppError::OAuth(e.to_string()))?.json().await.map_err(|e|AppError::OAuth(e.to_string()))?;
   let refresh=token.refresh_token.ok_or_else(||AppError::OAuth("Google did not return a refresh token. Try signing out of the app's Google consent and sign in again.".into()))?; storage::save_refresh_token(&refresh)?; self.access_token=Some(token.access_token); self.expires_at=Some(Instant::now()+Duration::from_secs(token.expires_in.saturating_sub(60))); self.state=AuthState{authenticated:true,..Default::default()}; Ok(self.state.clone())
  }
  pub async fn access_token(&mut self, app:&tauri::AppHandle)->Result<String,AppError>{if let (Some(t),Some(exp))=(&self.access_token,self.expires_at){if Instant::now() < exp { return Ok(t.clone()); }} self.refresh_access_token(app).await?;self.access_token.clone().ok_or(AppError::AuthRequired)}
@@ -93,7 +92,7 @@ impl AuthManager {
   if let Some(secret) = cfg.client_secret.as_deref() {
       form.push(("client_secret", secret));
   }
-  let req=Client::new().post(token_url).form(&form);
+  let req=crate::http::client().post(token_url).form(&form);
   let response=req.send().await.map_err(|e|AppError::Network(e.to_string()))?;
   if response.status()==reqwest::StatusCode::BAD_REQUEST {
    let body=response.text().await.unwrap_or_default();

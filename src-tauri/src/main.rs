@@ -3,6 +3,7 @@
 mod auth;
 mod calendar;
 mod error;
+mod http;
 mod models;
 mod storage;
 mod sync;
@@ -282,14 +283,10 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
                 window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        if !ALLOW_EXIT.load(Ordering::Relaxed) {
-                            api.prevent_close();
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                save_current_window_state(&app_handle);
-                                let _ = window.hide();
-                            }
-                        }
+                    if let WindowEvent::CloseRequested { .. } = event {
+                        // Native X button: save geometry and let the close proceed (app exits).
+                        save_current_window_state(&app_handle);
+                        ALLOW_EXIT.store(true, Ordering::Relaxed);
                     }
                 });
 

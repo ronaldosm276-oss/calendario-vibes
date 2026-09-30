@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import type { CalendarEvent, CalendarInfo, EventDraft } from '../types/calendar';
 import { X } from 'lucide-react';
+import { useFocusTrap } from '../hooks/useFocusTrap';
+import { normalizeHex } from '../utils/colors';
 
 interface Props {
   event?: CalendarEvent;
@@ -8,7 +10,9 @@ interface Props {
   calendars: CalendarInfo[];
   defaultCalendarId?: string;
   onClose: () => void;
-  onSave: (event: CalendarEvent) => Promise<void>;
+  onSave: (event: CalendarEvent, color: string | null) => Promise<void>;
+  eventColor?: string;
+  colorFor: (calendarId: string) => string;
   onDelete?: () => Promise<void>;
 }
 
@@ -64,7 +68,7 @@ function draftFromEvent(event: CalendarEvent | undefined, date: Date, calendarId
   };
 }
 
-export function EventDialog({ event, date, calendars, defaultCalendarId, onClose, onSave, onDelete }: Props) {
+export function EventDialog({ event, date, calendars, defaultCalendarId, onClose, onSave, onDelete, eventColor, colorFor }: Props) {
   const writableCalendars = calendars.filter(canWriteCalendar);
   const currentEventCalendar = event ? calendars.find(c => c.id === event.calendarId) : undefined;
   const selectableCalendars = event
@@ -75,6 +79,8 @@ export function EventDialog({ event, date, calendars, defaultCalendarId, onClose
   const [draft, setDraft] = useState<EventDraft>(() => draftFromEvent(event, date, initialCalendarId));
   const [saving, setSaving] = useState(false);
   const [validationError, setValidationError] = useState('');
+  const [color, setColor] = useState<string | null>(normalizeHex(eventColor));
+  const trapRef = useFocusTrap<HTMLDivElement>();
 
   useEffect(() => {
     setDraft(draftFromEvent(event, date, event?.calendarId || initialCalendarId));
@@ -120,7 +126,7 @@ export function EventDialog({ event, date, calendars, defaultCalendarId, onClose
             id: '', calendarId: draft.calendarId, summary: draft.title.trim(), description: draft.description, location: draft.location,
             start, end
           };
-      await onSave(payload);
+      await onSave(payload, color);
       onClose();
     } finally {
       setSaving(false);
@@ -128,7 +134,7 @@ export function EventDialog({ event, date, calendars, defaultCalendarId, onClose
   };
 
   return <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.currentTarget === e.target && !saving) onClose(); }}>
-    <div className="modal event-dialog" role="dialog" aria-modal="true" aria-label={event ? 'Event details' : 'New event'}>
+    <div className="modal event-dialog" ref={trapRef} role="dialog" aria-modal="true" aria-label={event ? 'Event details' : 'New event'}>
       <div className="modal-header"><div><strong>{event ? 'Event details' : 'New event'}</strong><span>{draft.date}</span></div><button aria-label="Close" onClick={onClose}><X size={17} /></button></div>
       <label>Title<input autoFocus maxLength={500} value={draft.title} onChange={e => setDraft({ ...draft, title: e.target.value })} placeholder="Event title" /></label>
       <div className="form-row"><label>Calendar<select disabled={Boolean(event) || readOnlyEventCalendar} value={draft.calendarId} onChange={e => setDraft({ ...draft, calendarId: e.target.value })}>{selectableCalendars.map(c => <option key={c.id} value={c.id}>{c.summary}</option>)}</select></label><label className="check-label"><input type="checkbox" checked={draft.allDay} onChange={e => setDraft({ ...draft, allDay: e.target.checked })} /> All day</label></div>
@@ -137,6 +143,7 @@ export function EventDialog({ event, date, calendars, defaultCalendarId, onClose
       {readOnlyEventCalendar && <div className="form-error" role="alert">This calendar is read-only for this account.</div>}
       {validationError && <div className="form-error" role="alert">{validationError}</div>}
       <label>Location<input maxLength={1000} value={draft.location} onChange={e => setDraft({ ...draft, location: e.target.value })} /></label>
+      <label>Color (saved in this app only)<div className="color-row"><input type="color" value={color ?? colorFor(draft.calendarId)} onChange={e => setColor(e.target.value)} />{color && <button type="button" className="reset-btn" onClick={() => setColor(null)}>Use calendar color</button>}</div></label>
       <label>Description<textarea maxLength={20000} rows={4} value={draft.description} onChange={e => setDraft({ ...draft, description: e.target.value })} /></label>
       <div className="modal-actions">{event && onDelete && <button className="danger-button" disabled={saving} onClick={() => void onDelete()}>Delete</button>}<span /><button onClick={onClose} disabled={saving}>Cancel</button><button className="primary-button" disabled={saving || readOnlyEventCalendar || !draft.title.trim() || !draft.calendarId} onClick={() => void save()}>{saving ? 'Saving…' : 'Save'}</button></div>
     </div>

@@ -4,7 +4,7 @@ use crate::{
     models::{CalendarEvent, CalendarInfo, EventTime},
     storage,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -87,7 +87,7 @@ pub async fn list_calendars(
     app: &tauri::AppHandle,
 ) -> Result<Vec<CalendarInfo>, AppError> {
     let token = auth.access_token(app).await?;
-    let client = Client::new();
+    let client = crate::http::client();
     let mut page_token: Option<String> = None;
     let mut calendars = Vec::new();
 
@@ -136,7 +136,7 @@ pub async fn list_events(
     let calendars = list_calendars(auth, app).await?;
     let colors = fetch_event_colors(auth, app).await.unwrap_or_default();
     let mut output = Vec::new();
-    let client = Client::new();
+    let client = crate::http::client();
 
     for calendar_id in calendar_ids {
         let calendar_color = calendars
@@ -210,7 +210,7 @@ pub async fn create_event(
     validate_event(event)?;
     let token = auth.access_token(app).await?;
     let body = to_google_body(event)?;
-    let response = Client::new()
+    let response = crate::http::client()
         .post(format!(
             "{BASE}/calendars/{}/events",
             urlencoding::encode(&event.calendar_id)
@@ -247,7 +247,7 @@ pub async fn update_event(
     validate_event(event)?;
     let token = auth.access_token(app).await?;
     let body = to_google_body(event)?;
-    let response = Client::new()
+    let response = crate::http::client()
         .patch(format!(
             "{BASE}/calendars/{}/events/{}",
             urlencoding::encode(&event.calendar_id),
@@ -284,7 +284,7 @@ pub async fn delete_event(
     event_id: &str,
 ) -> Result<(), AppError> {
     let token = auth.access_token(app).await?;
-    let response = Client::new()
+    let response = crate::http::client()
         .delete(format!(
             "{BASE}/calendars/{}/events/{}",
             urlencoding::encode(calendar_id),
@@ -355,7 +355,7 @@ async fn fetch_event_colors(
     app: &tauri::AppHandle,
 ) -> Result<HashMap<String, String>, AppError> {
     let token = auth.access_token(app).await?;
-    let response = Client::new()
+    let response = crate::http::client()
         .get(format!("{BASE}/colors"))
         .bearer_auth(token)
         .send()
@@ -388,7 +388,7 @@ async fn fetch_page(
     end: Option<&str>,
     sync_token: Option<&str>,
 ) -> Result<(Vec<CalendarEvent>, Vec<String>, Option<String>), AppError> {
-    let client = Client::new();
+    let client = crate::http::client();
     let mut next_page: Option<String> = None;
     let mut changed = Vec::new();
     let mut removed = Vec::new();
@@ -492,57 +492,27 @@ app: &tauri::AppHandle,
         // syncToken. Use an unbounded initial full sync so the token remains
         // valid for subsequent incremental synchronization.
         let token = storage::get_sync_token(app, &calendar_id)?;
+        let mut full = token.is_none();
         let result = fetch_page(
-            auth,
-            app,
-            &calendar_id,
-            calendar_color.clone(),
-            &event_colors,
-            None,
-            None,
-            token.as_deref(),
+            auth, app, &calendar_id, calendar_color.clone(), &event_colors, None, None, token.as_deref(),
         )
         .await;
 
         let (changed, removed, next_sync) = match result {
             Ok(value) => value,
             Err(AppError::SyncTokenExpired) => {
-                storage::clear_calendar(app, &calendar_id)?;
-                fetch_page(
-                    auth,
-                    app,
-                    &calendar_id,
-                    calendar_color,
-                    &event_colors,
-                    None,
-                    None,
-                    None,
-                )
-                .await?
+                // Token invalid: refetch everything; the cache is swapped atomically below (no clear first).
+                full = true;
+                fetch_page(auth, app, &calendar_id, calendar_color, &event_colors, None, None, None).await?
             }
             Err(error) => return Err(error),
         };
 
         synchronized += changed.len();
-        if token.is_some() {
-            if let Some(next_sync) = next_sync {
-                storage::apply_incremental_changes(
-                    app,
-                    &calendar_id,
-                    changed,
-                    &removed,
-                    next_sync,
-                )?;
-            }
-        } else {
-            storage::clear_calendar(app, &calendar_id)?;
-            storage::merge_events(app, changed)?;
-            for id in removed {
-                storage::remove_event(app, &calendar_id, &id)?;
-            }
-            if let Some(next_sync) = next_sync {
-                storage::set_sync_token(app, &calendar_id, Some(next_sync))?;
-            }
+        if full {
+            storage::replace_calendar_events(app, &calendar_id, changed, next_sync)?;
+        } else if let Some(next_sync) = next_sync {
+            storage::apply_incremental_changes(app, &calendar_id, changed, &removed, next_sync)?;
         }
     }
 
